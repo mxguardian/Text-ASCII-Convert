@@ -1,8 +1,8 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 use strict;
 use warnings;
-use MXG::App;
-use MXG::DB::MySQL;
+use DBI;
+use File::Basename;
 use Pod::Usage;
 use JSON;
 use Encode;
@@ -48,13 +48,35 @@ implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 binmode STDOUT, ":utf8";
 binmode STDERR, ":utf8";
 
-my $kernel = MXG::App->new();
-my $db = MXG::DB::MySQL->new(
-    $kernel->config('database_host'),
-    'unicode_db',
-    $kernel->config('database_user'),
-    $kernel->config('database_password')
-);
+# Read database config from .env file
+my %env;
+my $env_file = dirname(__FILE__) . '/.env';
+if (open my $efh, '<', $env_file) {
+    while (<$efh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        if (/^(\w+)\s*=\s*(.*)$/) {
+            $env{$1} = $2;
+        }
+    }
+    close $efh;
+} else {
+    die "Cannot open $env_file: $!\n";
+}
+
+my $db_host = $env{DATABASE_HOST}     || 'localhost';
+my $db_user = $env{DATABASE_USER}     || 'root';
+my $db_pass = $env{DATABASE_PASSWORD} || '';
+my $db = DBI->connect(
+    "DBI:mysql:database=unicode_db;host=$db_host",
+    $db_user, $db_pass,
+    { RaiseError => 1, mysql_enable_utf8mb4 => 1 }
+) or die "Cannot connect to database: $DBI::errstr\n";
+
+# Convenience wrappers
+sub db_fetch    { my ($sql, @bind) = @_; my $sth = $db->prepare($sql); $sth->execute(@bind); return $sth->fetchrow_hashref; }
+sub db_fetchAll { my ($sql, @bind) = @_; my $sth = $db->prepare($sql); $sth->execute(@bind); return $sth->fetchall_arrayref({}); }
+
 my $dispatch = {
     'create_schema'      => \&create_schema,
     'import_ucd'         => \&import_ucd,
@@ -355,7 +377,7 @@ sub decompose {
         my ($chars) = @_;
         my $base = '';
         foreach my $char (split /\s+/, $chars) {
-            my $data = $db->fetch("SELECT decomposition,ascii FROM `chars` WHERE hcode = ?", $char);
+            my $data = db_fetch("SELECT decomposition,ascii FROM `chars` WHERE hcode = ?", $char);
             if ( defined($data->{decomposition}) ) {
                 $base .= _decompose($data->{decomposition});
             } elsif ( defined($data->{ascii}) ) {
@@ -384,7 +406,7 @@ sub replace_tags {
         'S' => [ qw(5 $) ],
     );
 
-    my $chars = $db->fetchAll("SELECT ascii,hcode FROM `chars` WHERE ascii IS NOT NULL ORDER BY ascii");
+    my $chars = db_fetchAll("SELECT ascii,hcode FROM `chars` WHERE ascii IS NOT NULL ORDER BY ascii");
     my @patterns;
     my $last_ascii = '';
     foreach my $char (@$chars) {
@@ -407,7 +429,7 @@ sub replace_tags {
 # List of homoglyphs
 #
 sub list_all_homoglyphs {
-    my $chars = $db->fetchAll("SELECT ascii,hcode FROM `chars` WHERE ascii IS NOT NULL ORDER BY ascii");
+    my $chars = db_fetchAll("SELECT ascii,hcode FROM `chars` WHERE ascii IS NOT NULL ORDER BY ascii");
     my $str;
     my $last_ascii = '';
     foreach my $char (@$chars) {
@@ -430,7 +452,7 @@ sub list_homoglyphs {
     if ( !defined($ascii) ) {
         return list_all_homoglyphs();
     }
-    my $chars = $db->fetchAll("SELECT * FROM `chars` WHERE ascii = ? ORDER BY dcode",$ascii);
+    my $chars = db_fetchAll("SELECT * FROM `chars` WHERE ascii = ? ORDER BY dcode",$ascii);
     foreach my $char (@$chars) {
         my $hcode = $char->{hcode};
         # as a unicode string
@@ -453,7 +475,7 @@ sub list_homoglyphs {
 # list all Unicode characters
 #
 sub list_all {
-    my $chars = $db->fetchAll("SELECT * FROM `chars` ORDER BY dcode");
+    my $chars = db_fetchAll("SELECT * FROM `chars` ORDER BY dcode");
     foreach my $char (@$chars) {
         my $hcode = $char->{hcode};
         # as a unicode string
@@ -474,7 +496,7 @@ sub list_all {
 # List all zero-width characters
 #
 sub list_zw {
-    my $chars = $db->fetchAll("SELECT * FROM `chars` WHERE is_zero_width = 1 ORDER BY dcode");
+    my $chars = db_fetchAll("SELECT * FROM `chars` WHERE is_zero_width = 1 ORDER BY dcode");
     foreach my $char (@$chars) {
         my $hcode = $char->{hcode};
         # as a unicode string
@@ -494,7 +516,7 @@ sub list_zw {
 # List all unicode characters with ascii equivalents
 #
 sub list_ascii {
-    my $chars = $db->fetchAll("SELECT * FROM `chars` WHERE ascii IS NOT NULL ORDER BY dcode");
+    my $chars = db_fetchAll("SELECT * FROM `chars` WHERE ascii IS NOT NULL ORDER BY dcode");
     foreach my $char (@$chars) {
         my $hcode = $char->{hcode};
         my $str = chr(hex($hcode));
@@ -523,7 +545,7 @@ sub generate_map {
         truncate $fh, tell($fh);
     }
 
-    my $chars = $db->fetchAll("SELECT * FROM `chars` WHERE ascii IS NOT NULL ORDER BY dcode");
+    my $chars = db_fetchAll("SELECT * FROM `chars` WHERE ascii IS NOT NULL ORDER BY dcode");
     foreach my $char (@$chars) {
         my $hcode = $char->{hcode};
         my $ascii = $char->{ascii};
@@ -552,8 +574,8 @@ sub convert {
 #
 sub find_missing {
 
-    my $special = $db->fetchAll("SELECT * FROM special ORDER BY first_dcode");
-    my $chars = $db->fetchAll("SELECT dcode FROM `chars` ORDER BY dcode");
+    my $special = db_fetchAll("SELECT * FROM special ORDER BY first_dcode");
+    my $chars = db_fetchAll("SELECT dcode FROM `chars` ORDER BY dcode");
 
     my $last_dcode = -1;
     my $c = shift(@$chars);
