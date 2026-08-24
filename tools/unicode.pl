@@ -107,7 +107,8 @@ sub create_schema {
     my @sql = split /;\s*/, <<SQL;
 CREATE TABLE `chars` (
                         `hcode` char(5) NOT NULL,
-                        `description` varchar(255) CHARACTER SET latin1 DEFAULT NULL,
+                        `char` varchar(1) DEFAULT NULL,
+                        `description` varchar(255) DEFAULT NULL,
                         `ascii` char(6) CHARACTER SET latin1 DEFAULT NULL,
                         `block` varchar(255) DEFAULT NULL,
                         `script` char(4) DEFAULT NULL,
@@ -129,8 +130,6 @@ CREATE TABLE `chars` (
                         PRIMARY KEY (`hcode`),
                         KEY `sort` (`dcode`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TRIGGER `before_ins` BEFORE INSERT ON `chars` FOR EACH ROW SET NEW.dcode = CONV(NEW.hcode,16,10);
 
 CREATE TABLE `special` (
                            `first_dcode` int(11) unsigned NOT NULL,
@@ -158,14 +157,50 @@ sub import_ucd {
     use XML::Parser;
     use Archive::Zip;
 
-    my $ins_char = $db->prepare("INSERT IGNORE INTO `chars`
-        (`hcode`,description,block,script,category,bidi_class,combining_class,
-        is_upper,is_lower,is_emoji,is_whitespace,is_printable,
-        decomposition,uppercase,lowercase)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    # Rows are buffered and flushed as multi-row INSERTs. Inserting 200k+ rows
+    # one statement at a time is prohibitively slow when per-statement latency
+    # is high.
+    my $CHAR_COLS = 16;
+    my @char_buf;
+    my @special_buf;
 
-    my $ins_special = $db->prepare("INSERT IGNORE INTO `special`
-        (first_dcode,last_dcode,description) VALUES (?,?,?)");
+    my $flush_chars = sub {
+        return unless @char_buf;
+        # dcode is the decimal form of hcode, computed here so the schema
+        # needs no INSERT trigger to populate it
+        my $tuple = '(' . join(',', ('?') x $CHAR_COLS) . ',CONV(?,16,10))';
+        my $sql = "INSERT IGNORE INTO `chars`
+        (`hcode`,`char`,description,block,script,category,bidi_class,combining_class,
+        is_upper,is_lower,is_emoji,is_whitespace,is_printable,
+        decomposition,uppercase,lowercase,dcode) VALUES "
+        . join(',', ($tuple) x (scalar(@char_buf) / $CHAR_COLS));
+        # append hcode again per row to feed the CONV() for dcode
+        my @bind;
+        while (my @row = splice(@char_buf, 0, $CHAR_COLS)) {
+            push @bind, @row, $row[0];
+        }
+        $db->do($sql, undef, @bind);
+    };
+
+    my $flush_special = sub {
+        return unless @special_buf;
+        my $sql = "INSERT IGNORE INTO `special` (first_dcode,last_dcode,description) VALUES "
+        . join(',', ('(?,?,?)') x (scalar(@special_buf) / 3));
+        $db->do($sql, undef, @special_buf);
+        @special_buf = ();
+    };
+
+    my $ins_char = sub {
+        die "ins_char expects $CHAR_COLS values, got " . scalar(@_) . "\n"
+            unless @_ == $CHAR_COLS;
+        push @char_buf, @_;
+        $flush_chars->() if @char_buf >= $CHAR_COLS * 1000;
+    };
+
+    my $ins_special = sub {
+        push @special_buf, @_;
+        $flush_special->() if @special_buf >= 3 * 1000;
+    };
 
     my $group;
     my $xml = XML::Parser->new(Handlers => {
@@ -202,10 +237,15 @@ sub import_ucd {
                     my $char = chr($dcode);
                     my $desc = $name;
                     $desc =~ s/#/$hcode/;
-                    $desc = $char . ' ' . $desc if $printable==1;
 
-                    $ins_char->execute(
+                    # upgrade to a UTF8-flagged string; without this, Perl's
+                    # native 8-bit strings (U+0000-U+00FF) are sent as raw
+                    # bytes and rejected as invalid utf8mb4
+                    utf8::upgrade($char);
+
+                    $ins_char->(
                         $hcode,
+                        $printable ? $char : undef,
                         $desc,
                         $block,
                         $script,
@@ -235,7 +275,7 @@ sub import_ucd {
                     $first_dcode = hex($attr{'first-cp'});
                     $last_dcode = hex($attr{'last-cp'});
                 }
-                $ins_special->execute($first_dcode,$last_dcode,'Reserved');
+                $ins_special->($first_dcode,$last_dcode,'Reserved');
 
             } elsif ( $tag eq 'surrogate' ) {
                 my $first_dcode;
@@ -247,7 +287,7 @@ sub import_ucd {
                     $last_dcode = hex($attr{'last-cp'});
                 }
                 my $desc = $attr{blk} || 'Surrogate';
-                $ins_special->execute($first_dcode,$last_dcode,$desc);
+                $ins_special->($first_dcode,$last_dcode,$desc);
 
             } elsif ( $tag eq 'noncharacter' ) {
                 my $first_dcode;
@@ -258,7 +298,7 @@ sub import_ucd {
                     $first_dcode = hex($attr{'first-cp'});
                     $last_dcode = hex($attr{'last-cp'});
                 }
-                $ins_special->execute($first_dcode,$last_dcode,'Non-Character');
+                $ins_special->($first_dcode,$last_dcode,'Non-Character');
 
             } # end if
         } # end start
@@ -280,7 +320,11 @@ sub import_ucd {
     }
 
     print "Importing $xml_file...This will take a Micro\$oft minute.\n";
+    $db->begin_work;
     $xml->parsefile($xml_file);
+    $flush_chars->();
+    $flush_special->();
+    $db->commit;
 
 }
 
@@ -464,7 +508,6 @@ sub list_homoglyphs {
         $utf8hex =~ s/(..)/\\x$1/g;
 
         my $desc = $char->{description}||'';
-        $desc = decode("utf8",$desc);
         printf "U+%-5s %-17s %s\n", $hcode, $utf8hex, $desc;
     }
 }
@@ -487,7 +530,6 @@ sub list_all {
         $utf8hex =~ s/(..)/\\x$1/g;
 
         my $desc = $char->{description}||'';
-        $desc = decode("utf8",$desc);
         printf "U+%s %-15s %s\n", $hcode, $utf8hex, $desc;
     }
 }
@@ -620,10 +662,7 @@ sub explain {
             my $row = $sel_char->fetchrow_hashref;
             my $hcode = $row->{hcode};
             my $desc = $row->{description};
-            if ( $row->{is_printable} ) {
-                # fix description to include character
-                $desc = chr($dcode) . ' ' . substr($desc,2);
-            }
+            $desc = $row->{char} . ' ' . $desc if defined $row->{char};
             # print ASCII in green, others in red
             my $color = $dcode < 128 ? '0' : $dcode < 256 ? '33': '31';
             printf "\e[%sm%-50s U+%04X %s\e[0m\n", $color, $desc, $dcode, hex_to_utf8re($hcode);
